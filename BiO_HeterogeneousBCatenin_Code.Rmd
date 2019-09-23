@@ -1,0 +1,426 @@
+---
+Heterogeneous beta-catenin activation drives hepatocellular carcinoma in zebrafish - Single-cell RNA sequencing
+
+One liver each from the following adult male zebrafish: 
+x1: Tg(fabp10a:pt-B-cat) zebrafish with HCC (HepABC HCC);
+x2: CreLox zebrafish with HCC (CreLox HCC); and 
+x4: Zebrafish with no HCC containing the lox-switch transgene only (FloxABC)
+    
+Author: "Sharanya M Kalasekar"
+Date: "5/30/2019"
+Output: html_document
+---
+
+Verification on environment and loading of required packages:
+```{r}
+sessionInfo()
+library(dplyr)
+library(Seurat)
+
+```
+
+Data sets were loaded. Seurat objects were initialized with raw, non-mormalized data. 
+```{r}
+x1.data <- Read10X(data.dir = "/scratch/sharanya/Jan2019-smk/SimpleSingleCell/Data/15547X1_Cleaned")
+x2.data <- Read10X(data.dir = "/scratch/sharanya/Jan2019-smk/SimpleSingleCell/Data/15547X2_Cleaned")
+x4.data <- Read10X(data.dir = "/scratch/sharanya/Jan2019-smk/SimpleSingleCell/Data/15547X4_Cleaned")
+
+```
+
+Seurat objects with the raw (non-normalized data) were initialized, and cells with low gene counts were excluded. 
+```{r}
+x1 <- CreateSeuratObject(counts = x1.data, project = "MitoMinus-x1", min.cells = 3, min.features = 200)
+x1
+x2 <- CreateSeuratObject(counts = x2.data, project = "MitoMinus-x2", min.cells = 3, min.features = 200)
+x2
+x4 <- CreateSeuratObject(counts = x4.data, project = "MitoMinus-x4", min.cells = 3, min.features = 200)
+x4
+```
+
+QC metrics were calculated and visualized: 
+```{r}
+x1[["percent.mt"]] <- PercentageFeatureSet(x1, pattern = "^mt-")
+x2[["percent.mt"]] <- PercentageFeatureSet(x2, pattern = "^mt-")
+x4[["percent.mt"]] <- PercentageFeatureSet(x4, pattern = "^mt-")
+VlnPlot(x1, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(x2, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(x4, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+
+```
+
+Unwanted cells with low nCount_RNA (nUMIs) and cells with greater than 20% mitochondrial content were filtered out. 
+
+```{r}
+x1f <- subset(x1, subset = nCount_RNA > 800 & percent.mt < 20)
+x2f <- subset(x2, subset = nCount_RNA > 800 & percent.mt < 20)
+x4f <- subset(x4, subset = nCount_RNA > 800 & percent.mt < 20)
+VlnPlot(x1f, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(x2f, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(x4f, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+saveRDS(x1f, file="../MitoMinus/x1f_Filtered.rds")
+saveRDS(x2f, file="../MitoMinus/x2f_Filtered.rds")
+saveRDS(x4f, file="../MitoMinus/x4f_Filtered.rds")
+
+```
+
+Raw UMI counts were exported to MTX (market exchange format) for GEO submission after  
+having filtered out low quality cells and extremely sparse genes. 
+
+```{r, eval = FALSE}
+library(DropletUtils)
+path = "GEO_processed"
+write10xCounts(path=file.path("GEO_processed", "15547X1"), 
+                x = GetAssayData(x1f, slot = "counts", assay = "RNA"), 
+               type="sparse")
+write10xCounts(path=file.path("GEO_processed", "15547X2"), 
+                x = GetAssayData(x2f, slot = "counts", assay = "RNA"), 
+               type="sparse")
+write10xCounts(path=file.path("GEO_processed", "15547X4"), 
+                x = GetAssayData(x4f, slot = "counts", assay = "RNA"), 
+               type="sparse")
+
+```
+
+
+For further analysis, the data was normalized:
+```{r}
+x1f <- NormalizeData(x1f, normalization.method = "LogNormalize", scale.factor = 10000)
+x2f <- NormalizeData(x2f, normalization.method = "LogNormalize", scale.factor = 10000)
+x4f <- NormalizeData(x4f, normalization.method = "LogNormalize", scale.factor = 10000)
+
+```
+
+Highly variable markers, adn the top10 most variable genes were identified for each sample. 
+```{r}
+x1f <- FindVariableFeatures(x1f, selection.method = "vst", nfeatures = 2000)
+x2f <- FindVariableFeatures(x2f, selection.method = "vst", nfeatures = 2000)
+x4f <- FindVariableFeatures(x4f, selection.method = "vst", nfeatures = 2000)
+
+x1top10 <- head(VariableFeatures(x1f), 10)
+x2top10 <- head(VariableFeatures(x2f), 10)
+x4top10 <- head(VariableFeatures(x4f), 10)
+
+print(x1top10)
+print(x2top10)
+print(x4top10)
+```
+
+The data for the 2000 most highly variable genes was scaled and variations due to mitochondiral content were regressed out. 
+
+```{r}
+x1f <- ScaleData(x1f, vars.to.regress = "percent.mt")
+x2f <- ScaleData(x2f, vars.to.regress = "percent.mt")
+x4f <- ScaleData(x4f, vars.to.regress = "percent.mt")
+```
+
+Linear dimensional reduction was performed:
+
+```{r}
+x1f <- RunPCA(x1f, features = VariableFeatures(object = x1f))
+x2f <- RunPCA(x2f, features = VariableFeatures(object = x2f))
+x4f <- RunPCA(x4f, features = VariableFeatures(object = x4f))
+```
+
+PCs were chosen after visualization using JackStraw and Elbow Plots to choose PCs based on p values
+```{r}
+x1f <- JackStraw(x1f, num.replicate = 100)
+x1f <- ScoreJackStraw(x1f, dims = 1:20)
+JackStrawPlot(x1f, dims = 1:20)
+ElbowPlot(x1f)
+```
+
+```{r}
+x2f <- JackStraw(x2f, num.replicate = 100)
+x2f <- ScoreJackStraw(x2f, dims = 1:20)
+JackStrawPlot(x2f, dims = 1:20)
+ElbowPlot(x2f)
+
+```
+
+```{r}
+x4f <- JackStraw(x4f, num.replicate = 100)
+x4f <- ScoreJackStraw(x4f, dims = 1:20)
+JackStrawPlot(x4f, dims = 1:20)
+ElbowPlot(x4f)
+```
+
+From the JackStraw and Elbow plots, the PC cut-offs for the three samples were determined as:
+X1 - HepABC HCC- 12
+X2 - CreFlox HCC - 16
+X4 - FloxABC - 16
+
+
+The cells in each sample were then clustered using the chosen PC dimensions:
+
+```{r}
+x1f <- FindNeighbors(x1f, dims = 1:12)
+x1f <- FindClusters(x1f, resolution = 0.5)
+x2f <- FindNeighbors(x2f, dims = 1:16)
+x2f <- FindClusters(x2f, resolution = 0.5)
+x4f <- FindNeighbors(x4f, dims = 1:16)
+x4f <- FindClusters(x4f, resolution = 0.5)
+```
+
+Cluster IDs for the first 5 cells were computed to verify successful implementation:
+
+```{r}
+head(Idents(x1f), 5)
+head(Idents(x2f), 5)
+head(Idents(x4f), 5)
+```
+
+Non-linear dimensional reduction using t-SNE was then performed for each sample:
+
+```{r}
+x1f <- RunTSNE(x1f, dims = 1:12)
+DimPlot(x1f, reduction = "tsne")
+x2f <- RunTSNE(x2f, dims = 1:16)
+DimPlot(x2f, reduction = "tsne")
+x4f <- RunTSNE(x4f, dims = 1:16)
+DimPlot(x4f, reduction = "tsne")
+```
+
+Identification of cluster markers:
+
+```{r}
+x1f.markers <- FindAllMarkers(x1f, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+x1f.markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_logFC)
+top10_x1f <- x1f.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+DoHeatmap(x1f, features = top10_x1f$gene) + NoLegend()
+```
+
+```{r}
+x2f.markers <- FindAllMarkers(x2f, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+x2f.markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_logFC)
+top10_x2f <- x2f.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+DoHeatmap(x2f, features = top10_x2f$gene) + NoLegend()
+```
+
+```{r}
+x4f.markers <- FindAllMarkers(x4f, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+x4f.markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_logFC)
+top10_x4f <- x4f.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+DoHeatmap(x4f, features = top10_x4f$gene) + NoLegend()
+```
+
+
+To count the number of cells in each cluster in each sample:
+
+```{r}
+table(Idents(x1f))
+table(Idents(x2f))
+table(Idents(x4f))
+
+```
+
+To display cell number on t-SNE plots:
+
+```{r}
+table(Idents(x1f))
+number.cluster.x1f <- table(Idents(x1f))
+names(number.cluster.x1f) <- levels(x1f)
+x1f_num <- RenameIdents(x1f, number.cluster.x1f)
+DimPlot(x1f_num, reduction = "tsne", label = TRUE, pt.size = 0.5) + NoLegend()
+
+table(Idents(x2f))
+number.cluster.x2f <- table(Idents(x2f))
+names(number.cluster.x2f) <- levels(x2f)
+x2f_num <- RenameIdents(x2f, number.cluster.x2f)
+DimPlot(x2f_num, reduction = "tsne", label = TRUE, pt.size = 0.5) + NoLegend()
+
+table(Idents(x4f))
+number.cluster.x4f <- table(Idents(x4f))
+names(number.cluster.x4f) <- levels(x4f)
+x4f_num <- RenameIdents(x4f, number.cluster.x4f)
+DimPlot(x4f_num, reduction = "tsne", label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
+The dataframes of each sample with stored metadata of cluster identities of the component cells were then stored in reloadable RDS format for subsequent downstream analyses.
+
+```{r}
+saveRDS(x1f, file="../MitoMinus/x1f.rds")
+saveRDS(x2f, file="../MitoMinus/x2f.rds")
+saveRDS(x4f, file="../MitoMinus/x4f.rds")
+
+```
+
+
+A separate FindMarkers computation was performed for eahc cluster for each sample to obtain a pervasive list of markers to help with cluster cell type identification. 
+
+```{r}
+cluster0.x1f <- FindMarkers(object = x1f, ident.1 = 0, min.pct = 0.25)
+cluster1.x1f <- FindMarkers(object = x1f, ident.1 = 1, min.pct = 0.25)
+cluster2.x1f <- FindMarkers(object = x1f, ident.1 = 2, min.pct = 0.25)
+cluster3.x1f <- FindMarkers(object = x1f, ident.1 = 3, min.pct = 0.25)
+cluster4.x1f <- FindMarkers(object = x1f, ident.1 = 4, min.pct = 0.25)
+cluster5.x1f <- FindMarkers(object = x1f, ident.1 = 5, min.pct = 0.25)
+cluster6.x1f <- FindMarkers(object = x1f, ident.1 = 6, min.pct = 0.25)
+cluster7.x1f <- FindMarkers(object = x1f, ident.1 = 7, min.pct = 0.25)
+cluster8.x1f <- FindMarkers(object = x1f, ident.1 = 8, min.pct = 0.25)
+
+```
+
+```{r}
+cluster0.x2f <- FindMarkers(object = x2f, ident.1 = 0, min.pct = 0.25)
+cluster1.x2f <- FindMarkers(object = x2f, ident.1 = 1, min.pct = 0.25)
+cluster2.x2f <- FindMarkers(object = x2f, ident.1 = 2, min.pct = 0.25)
+cluster3.x2f <- FindMarkers(object = x2f, ident.1 = 3, min.pct = 0.25)
+cluster4.x2f <- FindMarkers(object = x2f, ident.1 = 4, min.pct = 0.25)
+cluster5.x2f <- FindMarkers(object = x2f, ident.1 = 5, min.pct = 0.25)
+cluster6.x2f <- FindMarkers(object = x2f, ident.1 = 6, min.pct = 0.25)
+cluster7.x2f <- FindMarkers(object = x2f, ident.1 = 7, min.pct = 0.25)
+cluster8.x2f <- FindMarkers(object = x2f, ident.1 = 8, min.pct = 0.25)
+cluster9.x2f <- FindMarkers(object = x2f, ident.1 = 9, min.pct = 0.25)
+cluster10.x2f <- FindMarkers(object = x2f, ident.1 = 10, min.pct = 0.25)
+
+```
+
+```{r}
+cluster0.x4f <- FindMarkers(object = x4f, ident.1 = 0, min.pct = 0.25)
+cluster1.x4f <- FindMarkers(object = x4f, ident.1 = 1, min.pct = 0.25)
+cluster2.x4f <- FindMarkers(object = x4f, ident.1 = 2, min.pct = 0.25)
+cluster3.x4f <- FindMarkers(object = x4f, ident.1 = 3, min.pct = 0.25)
+cluster4.x4f <- FindMarkers(object = x4f, ident.1 = 4, min.pct = 0.25)
+cluster5.x4f <- FindMarkers(object = x4f, ident.1 = 5, min.pct = 0.25)
+cluster6.x4f <- FindMarkers(object = x4f, ident.1 = 6, min.pct = 0.25)
+cluster7.x4f <- FindMarkers(object = x4f, ident.1 = 7, min.pct = 0.25)
+cluster8.x4f <- FindMarkers(object = x4f, ident.1 = 8, min.pct = 0.25)
+
+
+```
+
+
+
+Table S17. Analysis of jun expression levels in hepatocytes from each sample. 
+ 
+```{r}
+hep.x1f <- subset(x = x1f, idents = c("0", "1", "2", "3", "4", "6", "7"))
+table(Idents(hep.x1f))
+hep.x2f <- subset(x = x2f, idents = c("0", "1", "2", "4", "7", "10"))
+table(Idents(hep.x2f))
+hep.x4f <- subset(x = x4f, idents = c( "1", "2", "4"))
+table(Idents(hep.x4f))
+
+# Only considering cells with non-zero expression of jun:
+
+sum(GetAssayData(object = hep.x1f, slot = "data")["jun",]>0)
+sum(GetAssayData(object = hep.x1f, slot = "data")["jun",]>0)/nrow(hep.x1f@meta.data)
+
+sum(GetAssayData(object = hep.x2f, slot = "data")["jun",]>0)
+sum(GetAssayData(object = hep.x2f, slot = "data")["jun",]>0)/nrow(hep.x2f@meta.data)
+
+sum(GetAssayData(object = hep.x4f, slot = "data")["jun",]>0)
+sum(GetAssayData(object = hep.x4f, slot = "data")["jun",]>0)/nrow(hep.x4f@meta.data)
+
+
+hx1f.jun <- subset(x = hep.x1f, subset = jun > 0)
+hx2f.jun <- subset(x = hep.x2f, subset = jun > 0)
+hx4f.jun <- subset(x = hep.x4f, subset = jun > 0)
+
+Seurat::Idents(hx1f.jun) <- factor("All")
+Seurat::AverageExpression(hx1f.jun)
+AverageExpression(hx1f.jun, features = "jun")
+
+Seurat::Idents(hx2f.jun) <- factor("All")
+Seurat::AverageExpression(hx2f.jun)
+AverageExpression(hx2f.jun, features = "jun")
+
+Seurat::Idents(hx4f.jun) <- factor("All")
+Seurat::AverageExpression(hx4f.jun)
+AverageExpression(hx4f.jun, features = "jun")
+
+
+```
+
+Integrated analysis of cells from all three samples:
+
+```{r}
+library(ggplot2)
+library(cowplot)
+```
+
+
+```{r}
+
+multi.list <- list(intx1 = readRDS(file = '../MitoMinus/x1f.rds'),
+                   intx2 = readRDS(file = '../MitoMinus/x2f.rds'),
+                   intx4 = readRDS(file = '../MitoMinus/x4f.rds'))
+
+multi.list <- lapply(multi.list, NormalizeData, verbose = FALSE)
+multi.list <- lapply(multi.list, FindVariableFeatures, selection.method = "vst", nfeatures = 2000, 
+                   verbose = FALSE)
+
+multi.anchors <- FindIntegrationAnchors(object.list = multi.list, dims = 1:20)
+multi.integrated <- IntegrateData(anchorset = multi.anchors, dims = 1:20)
+
+DefaultAssay(multi.integrated) <- "integrated"
+```
+
+Performing the standard Seurat-recommended workflow for visualization and clustering:
+```{r}
+multi.integrated <- ScaleData(multi.integrated, verbose = FALSE)
+multi.integrated <- RunPCA(multi.integrated, npcs = 20, verbose = FALSE)
+Seurat::ElbowPlot(multi.integrated, ndims = 20)
+
+
+multi.integrated <- RunTSNE(multi.integrated, reduction = "pca", dims = 1:20)
+DimPlot(multi.integrated, reduction = "tsne", group.by = "orig.ident")
+
+```
+
+Plotting a tSNE representation of the clustering of cells integrated from all three samples (Figure 7):
+```{r}
+multi.integrated <- FindNeighbors(multi.integrated, k.param = 50)
+multi.integrated <- FindClusters(object = multi.integrated)
+DimPlot(object = multi.integrated, reduction = "tsne")
+```
+
+```{r}
+p1 <- FeaturePlot(multi.integrated, reduction = "tsne", features = "nFeature_RNA")
+p2 <- FeaturePlot(multi.integrated, reduction = "tsne", features = "percent.mt")
+p3 <- FeaturePlot(multi.integrated, reduction = "tsne", features = "nCount_RNA")
+plot_grid(p1, p2, p3)
+```
+
+
+```{r}
+table(Idents(multi.integrated))
+```
+
+Calculating the proportion of cells from each sample within the different clusters in Figures 7A/7B: 
+```{r}
+table(multi.integrated$seurat_clusters, multi.integrated$orig.ident)
+round(prop.table(table(multi.integrated$seurat_clusters, multi.integrated$orig.ident), 2) * 100, 2)
+round(prop.table(table(multi.integrated$seurat_clusters, multi.integrated$orig.ident), 1) * 100, 2)
+# 1, 5, 6 - DAVID 
+# 1,5,6 combined compared to all others
+```
+
+
+Identification of markers for each cluster in Figure 7A:
+```{r}
+integ.markers <- FindAllMarkers(multi.integrated, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+top10_integ <- integ.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+DoHeatmap(multi.integrated, features = top10_integ$gene) + NoLegend()
+```
+
+Plot the number of cells in each cluster in Figure 7A. 
+```{r}
+table(Idents(multi.integrated))
+number.cluster.integ <- table(Idents(multi.integrated))
+names(number.cluster.integ) <- levels(multi.integrated)
+integ_num <- RenameIdents(multi.integrated, number.cluster.integ)
+
+DimPlot(integ_num, reduction = "tsne", label = TRUE, pt.size = 0.5, label.size = 7) 
+
+DimPlot(multi.integrated, reduction = "tsne", label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
+Figure 7C: Computing the expression of wnt target genes in each cluster from the integrated analysis (Fig 7A). 
+```{r}
+wnt_targets <- c("mtor", "glula", "wif1", "axin2","jun", "myca")
+DotPlot (object = multi.integrated, features = wnt_targets, assay = "RNA")
+
+```
