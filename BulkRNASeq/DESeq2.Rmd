@@ -1,0 +1,297 @@
+---
+title: "DESeq analysis for 16048R"
+date: '`r gsub("  ", " ", format(Sys.time(), "%B %e, %Y"))`'
+output: html_document
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, comment="# ", collapse=TRUE, fig.path = 'Figures/', dev = c('png', 'pdf'))
+library(hciR)
+library(readr)
+library(hciRdata)
+```
+
+This guide follows the [Bioconductor RNA-Seq workflow] to find differentially expressed
+genes using [DESeq2] version `r gsub("‘’", "", packageVersion("DESeq2"))` and
+the [hciR] package on Github to simplify the [R] code.
+
+## Load samples and counts
+
+We will clean the default meta-data sheet and write it to file.
+
+```{r}
+raw_samples <- readr::read_tsv('16048R_2019-06-11.txt')
+samples <- dplyr::select(raw_samples, ID, `Sample Name`, `Individual`) %>% 
+  dplyr::rename(id= ID, name = `Sample Name`, raw_trt = Individual) %>% 
+  dplyr::mutate(trt = gsub(x = raw_trt,
+                           pattern = "Tg +HCC", 
+                           replacement = "Tg.HCC",
+                           fixed = T)) %>% 
+  dplyr::mutate(trt = gsub(x = trt,
+                           pattern = "Tg+HCC", 
+                           replacement = "Tg.HCC",
+                           fixed = T)) %>%  
+  dplyr::mutate(trt = gsub(x = trt,
+                           pattern = "Tg+HCC", 
+                           replacement = "Tg.HCC",
+                           fixed = T)) %>% 
+  dplyr::mutate(trt = gsub(x = trt,
+                           pattern = "Tg without HCC", 
+                           replacement = "Tg.noHCC",
+                           fixed = T)) %>% 
+  dplyr::mutate(trt = gsub(x = trt,
+                           pattern = "Non-Tg", 
+                           replacement = "noTg.noHCC",
+                           fixed = T)) 
+samples
+readr::write_csv(x = samples %>% dplyr::select(id, name, trt), 
+                 path = 'samples.csv')
+```
+
+
+Load the id, name and individual column from the sample table.
+
+```{r load_samples, message=FALSE}
+samples <- read_csv("samples.csv")
+samples$trt <- factor(samples$trt, levels = c("noTg.noHCC", "Tg.noHCC","Tg.HCC"))
+samples
+```
+
+Load the count matrix with unique reads assigned to features.
+
+```{r load_counts, message=FALSE, echo=-1}
+options(width=110)
+counts <- readr::read_tsv("../Counts/Subread/counts.txt")
+counts[, 1:8]
+```
+
+Remove 6862  features with zero counts and 5803  features with 5 or fewer reads in any sample
+to create a final count matrix with 20679 rows.
+
+```{r filter_counts}
+counts <- filter_counts(counts, n = 5)
+```
+
+### Run DESeq
+
+Run `DESeq` using ~ trt in the design formula and get the regularized log
+transforms (rlog) for sample visualizations.
+
+```{r run_DESeq, eval=TRUE}
+dds <- deseq_from_tibble(counts, samples, design = ~ trt )
+rld <- r_log(dds)
+```
+
+
+Plot the first two principal components (PCs) using the rlog values from the top 500 variable genes. Sample 16048X4 is rather distant from all samples as well as its own treatment group 'noTg.noHCC'. Also sample 16048X8 has a sufficiently different expresion from the 'Tg.HCC' group. Whether it makes sense to drop either of these samples from the DESeq2 model is not clear at this point. On a related point, the distribution of samples within treatment groups across the PC1 and PC2 does not appear to strongly support similar levels biological variance across groups. With this few of samples per group it can be hard to determine from the data whether this assumption is true or not. Therefore, we choose to fit 3 separate models involving each of the pairwise groups separately. This decision is [supported by the DESeq2 users' guide](https://www.bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#if-i-have-multiple-groups-should-i-run-all-together-or-split-into-pairs-of-groups).  
+
+```{r pcaplot}
+plot_pca(rld, "trt", width=700)
+```
+
+
+Cluster all the rlog values using the R function `dist` to calculate the Euclidean
+distance between samples.
+
+```{r plot_dist, fig.width=6, fig.height=4.75}
+plot_dist(rld, "trt", na="white", annotation_names_col=FALSE)
+```
+
+
+## Tg.HCC vs. Tg.noHCC
+
+
+Subset the levels Tg.HCC and Tg.noHCC. Re-filter low-expressing genes. 
+
+```{r}
+groups1 <- c("Tg.HCC", "Tg.noHCC")
+samples1 <- dplyr::filter(samples, trt %in% groups1) %>% 
+  dplyr::mutate(trt = droplevels(trt)) %>% 
+  dplyr::mutate(trt = factor(trt, levels = groups1)) 
+stopifnot(identical(samples$id, colnames(counts)[2:11]))
+counts1 <- counts[,c("geneid",samples1$id)]
+counts1 <- filter_counts(counts1, n = 5)
+```
+
+Re-fit the DESeq2 model. 
+
+```{r run_DESeq1, eval=TRUE}
+dds1 <- deseq_from_tibble(counts1, samples1, design = ~ trt )
+rld1 <- r_log(dds1)
+```
+
+Re-do PCA.
+
+```{r pcaplot1}
+plot_pca(rld1, "trt", width=700)
+```
+
+Cluster samples. 
+
+```{r plot_dist1, fig.width=6, fig.height=4.75}
+plot_dist(rld1, "trt", na="white", annotation_names_col=FALSE)
+```
+
+Infer the differences between pairwise comparison Tg.HCC vs. Tg.noHCC at FDR 5%.
+
+```{r results1, eval=TRUE}
+res1 <- results_all(dds1, zebrafish94)
+```
+
+Plot fold changes and p-values in a volcano plot.
+
+```{r plot_volcano1, fig.width=7, fig.height=5.5}
+plot_volcano(res1, ggplot=TRUE, pvalue = 3)
+```
+
+Cluster the top 50 significant genes sorted by p-value and scale by rows, so values are the number
+of standard deviations from the mean rlog.
+
+```{r gene_heatmap1, fig.width=6, fig.height=10}
+x1 <- top_counts( res1, rld1, top=50)
+plot_genes(x1, "trt", scale="row", show_rownames=TRUE, annotation_names_col=FALSE)
+```
+
+
+Save the DESeq results to a single Excel file and R objects to a
+binary data file to load into a new session. The Excel file will contain raw
+counts, rlog values, normalized counts, samples and gene annotations in the
+Excel file.
+
+```{r write_results_to_Excel1, eval=TRUE}
+write_deseq(res1, dds1, rld1, zebrafish94, file = 'Tables/TgHCC_vs_TgnoHCC.xlsx')
+save(res1, dds1, rld1, zebrafish94, file="Cache/TgHCC_vs_TgnoHCC.rda")
+```
+
+
+## Tg.HCC vs. noTg.noHCC
+
+Subset the levels Tg.HCC and noTg.noHCC. Re-filter low-expressing genes. 
+
+```{r}
+groups2 <- c("Tg.HCC", "noTg.noHCC")
+samples2 <- dplyr::filter(samples, trt %in% groups2) %>% 
+  dplyr::mutate(trt = droplevels(trt)) %>% 
+  dplyr::mutate(trt = factor(trt, levels = groups2)) 
+counts2 <- counts[,c("geneid",samples2$id)]
+counts2 <- filter_counts(counts2, n = 5)
+```
+
+Re-fit the DESeq2 model. 
+
+```{r run_DESeq2, eval=TRUE}
+dds2 <- deseq_from_tibble(counts2, samples2, design = ~ trt )
+rld2 <- r_log(dds2)
+```
+
+Re-do PCA.
+
+```{r pcaplot2}
+plot_pca(rld2, "trt", width=700)
+```
+
+Cluster samples. 
+
+```{r plot_dist2, fig.width=6, fig.height=4.75}
+plot_dist(rld2, "trt", na="white", annotation_names_col=FALSE)
+```
+
+Infer the differences between pairwise comparison Tg.HCC vs. noTg.noHCC at FDR 5%.
+
+```{r results2, eval=TRUE}
+res2 <- results_all(dds2, zebrafish94)
+```
+
+Plot fold changes and p-values in a volcano plot.
+
+```{r plot_volcano2, fig.width=7, fig.height=5.5}
+plot_volcano(res2, ggplot=TRUE, pvalue = 20)
+```
+
+Cluster the top 50 significant genes sorted by p-value and scale by rows, so values are the number
+of standard deviations from the mean rlog.
+
+```{r gene_heatmap2, fig.width=6, fig.height=10}
+x2 <- top_counts( res2, rld2, top=50)
+plot_genes(x2, "trt", scale="row", show_rownames=TRUE, annotation_names_col=FALSE)
+```
+
+Save the results.
+
+```{r write_results_to_Excel2, eval=TRUE}
+write_deseq(res2, dds2, rld2, zebrafish94, file = 'Tables/TgHCC_vs_noTgnoHCC.xlsx')
+save(res2, dds2, rld2, zebrafish94, file="Cache/TgHCC_vs_noTgnoHCC.rda")
+```
+
+## Tg.noHCC vs. noTg.noHCC
+
+Subset the levels Tg.noHCC and noTg.noHCC. Re-filter low-expressing genes. 
+
+```{r}
+groups3 <- c("Tg.noHCC", "noTg.noHCC")
+samples3 <- dplyr::filter(samples, trt %in% groups3) %>% 
+  dplyr::mutate(trt = droplevels(trt)) %>% 
+  dplyr::mutate(trt = factor(trt, levels = groups3)) 
+counts3 <- counts[,c("geneid",samples3$id)]
+counts3 <- filter_counts(counts3, n = 5)
+```
+
+Re-fit the DESeq2 model. 
+
+```{r run_DESeq3  , eval=TRUE}
+dds3 <- deseq_from_tibble(counts3, samples3, design = ~ trt )
+rld3 <- r_log(dds3)
+```
+
+Re-do PCA.
+
+```{r pcaplot3}
+plot_pca(rld3, "trt", width=700)
+```
+
+Cluster samples. 
+
+```{r plot_dist3, fig.width=6, fig.height=4.75}
+plot_dist(rld3, "trt", na="white", annotation_names_col=FALSE)
+```
+
+Infer the differences between pairwise comparison Tg.noHCC vs. noTg.noHCC at FDR 5%.
+
+```{r results3, eval=TRUE}
+res3 <- results_all(dds3, zebrafish94)
+```
+
+Plot fold changes and p-values in a volcano plot.
+
+```{r plot_volcano3, fig.width=7, fig.height=5.5}
+plot_volcano(res3, ggplot=TRUE, pvalue = 10)
+```
+
+Cluster the 50 top significant genes sorted by p-value and scale by rows, so values are the number
+of standard deviations from the mean rlog.
+
+```{r gene_heatmap3, fig.width=6, fig.height=10}
+x3 <- top_counts( res3, rld3, top=50)
+plot_genes(x3, "trt", scale="row", show_rownames=TRUE, annotation_names_col=FALSE)
+```
+
+Save the results.
+
+```{r r write_results_to_Excel3, eval=TRUE}
+write_deseq(res3, dds3, rld3, zebrafish94, file = 'Tables/TgnoHCC_vs_noTgnoHCC.xlsx')
+save(res3, dds3, rld3, zebrafish94, file="Cache/TgnoHCC_vs_noTgnoHCC.rda")
+```
+
+
+<br>
+
+[Bioconductor RNA-Seq workflow]: http://www.bioconductor.org/help/workflows/rnaseqGene
+[DESeq2]: http://www.bioconductor.org/packages/release/bioc/html/DESeq2.html
+[hciR]: https://github.com/HuntsmanCancerInstitute/hciR
+[hciRdata]: https://github.com/HuntsmanCancerInstitute/hciRdata
+[R]: https://www.r-project.org
+
+```{r}
+sessionInfo()
+```
+
