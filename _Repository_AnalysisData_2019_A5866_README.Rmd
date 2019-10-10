@@ -1,0 +1,175 @@
+---
+title: "STAR alignments for 16048R"
+date: '`r gsub("  ", " ", format(Sys.time(), "%B %e, %Y"))`'
+output:
+  html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, comment="", collapse=TRUE)
+```
+
+This guide describes the steps used to run [STAR] and other bioinformatic tools
+on the Fastq files in GNomEx. All the commands listed in steps #2 to #6 are
+organized in a `cmd.txt` file,  which is used to send jobs to the [CHPC]
+clusters following the [Pysano] reference manual.  This file also includes
+[shell] scripts to parse sample names from FASTQ files and then read and write
+to different output files with that prefix.
+
+### 1. Create reference
+
+Download the zebrafish FASTA and GTF file from [Ensembl] release 94 and
+run [STAR] with the `genomeGenerate` option to create the reference database.
+The `sjdbGTFfile` option extracts splice junctions from the GTF file with a
+maximum possible overhang of 124 bases (for 125 bp reads).
+
+```{bash star_ref, eval=FALSE}
+wget ftp://ftp.ensembl.org/pub/release-94/fasta/danio_rerio/dna/Danio_rerio.GRCz11.dna.primary_assembly.fa.gz
+wget ftp://ftp.ensembl.org/pub/release-94/gtf/danio_rerio/Danio_rerio.GRCz11.94.gtf.gz
+gunzip *.gz
+
+STAR --runMode genomeGenerate \
+     --genomeDir star125 \
+     --runThreadN 24 \
+     --genomeFastaFiles Danio_rerio.GRCz11.dna.primary_assembly.fa \
+     --sjdbGTFfile Danio_rerio.GRCz11.94.gtf \
+     --sjdbOverhang 124
+```
+
+### 2. Remove optical duplicates & Trim adapters
+
+Use BBmap's clumpify to remove optical duplicates, which are reported to occur at higher rates on NovaSeq instruments.
+
+```{bash clumpify, eval=FALSE}
+CLUMPIFY=$APP/BBmap/v38.34/clumpify.sh
+$CLUMPIFY in1=16048X1.1.fq in2=16048X1.2.fq  out1=16048X1.clump1.fq.gz \
+ out2=$16048X1.clump2.fq.gz dupedist=12000 dedupe=t optical=t
+```
+
+Trim the Illumina adpater sequence using [cutadapt] version 1.16.  The -O
+option starts trimming after 6 matching bases and -m option will discard trimmed
+reads shorter than 20 bases
+
+```{bash cutadapt, eval=FALSE}
+cutadapt -j 24 -O 6 -m 20 \
+ -a AGATCGGAAGAGCACACGTCTGAACTCCAGTCA \
+ -A AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+ -o 16048X1.1.fq -p 16048X1.2.fq \
+ 16048X1.clump1.fq.gz 16048X1.clump2.fq.gz
+```
+
+### 3. Run FastQC
+
+Run [FastQC] on the trimmed fastq file.  This ouputs sequence length distributions,
+overrepresented sequences and many other statistics.
+
+```{bash fastq, eval=FALSE}
+fastqc -f fastq 16048X1.1.fq
+fastqc -f fastq 16048X1.2.fq
+```
+
+### 4. Align reads
+
+Align the trimmed reads using [STAR] version version 2.6.1b to the zebrafish
+reference in two pass mode and output a BAM file sorted by
+coordinates and unstranded bedGraph file.
+The `quantMode` option outputs alignments to transcript coordinates for [RSEM].
+
+```{bash star_run, eval=FALSE}
+STAR --genomeDir star125 \
+     --runThreadN 24 \
+     --readFilesIn 16048X1.1.fq 16048X1.2.fq \
+     --twopassMode Basic \
+     --outSAMtype BAM SortedByCoordinate \
+     --quantMode TranscriptomeSAM \
+     --outWigType bedGraph \
+     --outWigStrand Unstranded
+```
+
+### 5. Count features
+
+Rename the STAR output BAM file and run [featureCounts] version 1.5.1 to count uniquely
+aligned reads overlapping features in the GTF file.
+
+```{bash counts, eval=FALSE}
+mv Aligned.sortedByCoord.out.bam 16048X1.bam
+featureCounts -T 24 -p -s 2  --largestOverlap -a Danio_rerio.GRCz11.94.gtf 16048X1.counts 16048X1.bam
+```
+
+STAR reports unique reads and reads that map to 2 to 10 locations on the genome.  These multi-mapping
+reads can be assigned to features using [RSEM], which returns the expected counts to transcripts and genes
+in `16048X1.isoforms.results` or `16048X1.genes.results`.  These count tables are not used
+in the differential expression analyses unless requested.
+
+
+### 6. Check quality
+
+Run Picard [CollectRnaSeqMetrics] to count the number of reads matching exons,
+UTRs, introns and intergenic regions and to calculate the normalized gene
+coverage from the top 1000 expressed transcripts. Finally, run [samtools idxstats] to
+count the number of reads per chromosome.
+
+### 7. Summarize alignments
+
+[MultiQC] searches the Alignments directory for analysis logs and compiles an
+HTML report that includes interactive summary tables and plots for all commands
+in the `cmd.txt` file.
+
+```{r multiqc, eval=FALSE}
+multiqc Alignments
+```
+
+The General Statistics table at the top of the report includes summaries from
+FastQC like total sequences (M Seqs), STAR (M Aligned), featureCounts (M
+Assigned) and collectRNASeqMetrics (% rRNA and mRNA).   The remaining sections
+summarize outputs from each program.
+
+### 8.  View alignments
+
+Load a BAM file into a database browser like [IGV] by clicking the URL link icon
+next to the BAM file name in GNomEx.   Copy and paste the link into IGV by
+selecting "File, Load from URL".   Search for a gene or zoom into a specific
+region to check alignments. If reads do not align with annotations, make sure
+the correct reference assembly is selected (hg38, mm10, rn6, etc.).  Also,
+right click on the track and  color by first of pair strand to check if the first
+read aligns in the opposite direction of the feature (note red is the positive
+strand  and blue is negative).   This is usually the case for stranded Illumina
+paired end sequencing runs so the `-s 2` option in `featureCounts` was used to
+count reversely stranded reads.
+
+To compare many samples, it's easier to load the bigWig files in GNomEx. The
+STAR aligner normalizes coverage files by default, so the units are reads per
+million mapped reads (RPM). In addition, separate coverage files are created for
+unique reads (\*.unique.bw) and unique plus multi-mapping reads
+(\*.multiple.bw).
+
+[IGV] displays a normalized coverage plot and RPM values at each position.
+If needed, multiply the RPM by the number of unique alignments from
+STAR in the [MultiQC] file to get the total reads at that base (for example,
+24.45863 RPM * 21873674 uniquely aligned reads/1000000 = 535 total reads).
+Finally, select multiple tracks and right click to set the same minimun and
+maximum values to display in the y-axis range by selecting Group Autoscale.
+
+### 9. Differential Expression
+
+See the `DESeq2/DESeq2.html` report for further details on the differential expression analysis using
+[DESeq2] version `r gsub("‘’", "", packageVersion("DESeq2"))`. The detailed output of the DESeq2 analysis
+is reported in tabular Excel format in the DESeq2/Tables. Corresponding figures are in DESeq2/Figures.
+
+<br>
+
+
+[DESeq2]: http://www.bioconductor.org/packages/release/bioc/html/DESeq2.html
+[RSEM]: https://deweylab.github.io/RSEM/
+[cutadapt]: http://cutadapt.readthedocs.io/en/stable/index.html
+[STAR]: https://github.com/alexdobin/STAR
+[Ensembl]: http://uswest.ensembl.org/info/data/ftp/index.html
+[Pysano]: https://uofuhealth.utah.edu/huntsman/shared-resources/gba/bioinformatics/infrastructure/pysano.php
+[CHPC]: https://www.chpc.utah.edu/
+[shell]: http://tldp.org/LDP/abs/html/index.html
+[IGV]: http://software.broadinstitute.org/software/igv/
+[featureCounts]: http://bioinf.wehi.edu.au/featureCounts/
+[FastQC]: http://www.bioinformatics.babraham.ac.uk/projects/fastqc/
+[CollectRnaSeqMetrics]: https://broadinstitute.github.io/picard/command-line-overview.html#CollectRnaSeqMetrics
+[samtools idxstats]: http://www.htslib.org/
+[MultiQC]: http://multiqc.info/
